@@ -1,0 +1,173 @@
+%================================================
+% Author: W. Chan
+% Date:   18 Jan 2023
+%================================================
+clear
+
+global fi_flag_Simulink
+
+%% Trim aircraft to desired altitude and velocity
+%%
+% lastname B., last number 300
+altitude = 5000;
+velocity = 300;
+
+
+disp('At what flight condition would you like to trim the F-16?');
+disp('1.  Steady Wings-Level Flight.');
+disp('2.  Steady Turning Flight.');
+disp('3.  Steady Pull-Up Flight.');
+disp('4.  Steady Roll Flight.');
+FC_flag = 1;
+
+disp('We are working with:');
+disp(FC_flag)
+
+x_a = 5.9;
+g_d = 32.17; %gravitational acceleration in ft per second squared
+
+%% Initial guess for trim
+%%
+thrust = 5000;          % thrust, lbs
+elevator = -0.09;       % elevator, degrees
+alpha = 8.49;              % AOA, degrees
+rudder = -0.01;             % rudder angle, degrees
+aileron = 0.01;            % aileron, degrees
+
+%% Find trim for lofi model at desired altitude and velocity
+%%
+disp('Trimming Low Fidelity Model:');
+fi_flag_Simulink = 0;
+[trim_state_lo, trim_thrust_lo, trim_control_lo, dLEF, xu_lo] = trim_F16(thrust, elevator, alpha, aileron, rudder, velocity, altitude, FC_flag);
+
+%% Find the state space model for the lofi model at the desired alt and vel.
+%%
+trim_state_lin = trim_state_lo; trim_thrust_lin = trim_thrust_lo; trim_control_lin = trim_control_lo;
+operating_point = operpoint('LIN_F16Block'); % retrieves initial conditions from integrators
+operating_point.Inputs(1).u = trim_thrust_lin; operating_point.Inputs(2).u = trim_control_lin(1);
+operating_point.Inputs(3).u = trim_control_lin(2); operating_point.Inputs(4).u = trim_control_lin(3);
+
+SS_lo = linearize('accelerometer_LIN_F16Block');
+
+%% GlideSlope calculator
+glide_states = [3, 7, 8, 5, 11];     %h, Vt, alpha, theta, q
+glide_inputs = [13, 14];             %thrust, elevator
+SS_glide_A = SS_lo.A(glide_states, glide_states);
+SS_glide_B = SS_lo.A(glide_states, glide_inputs);
+SS_glide_C = SS_lo.C(glide_states, glide_states);
+SS_glide_D = SS_lo.C(glide_states, glide_inputs);
+
+ss_sys = ss(SS_glide_A, SS_glide_B, SS_glide_C, SS_glide_D);
+tf_sys = tf(ss_sys);
+thrust_2_outs = minreal(tf_sys(:,1)); thrust_2_outs.InputName = 'd_thrust'; thrust_2_outs.OutputName = {'h', 'Vt', 'alpha', 'theta', 'q'};
+elevator_2_outs = minreal(tf_sys(:,2)); elevator_2_outs.InputName = 'd_elevaotr' ; elevator_2_outs.OutputName = {'h', 'Vt', 'alpha', 'theta', 'q'};
+
+s = tf('s');
+
+%% pitch rate command system
+e2q = minreal(elevator_2_outs(5));
+% rltool(e2q);
+kq = -20;
+
+e2q_closed = kq*e2q/(1+kq*e2q);
+e2t = minreal(e2q_closed/s);
+% rltool(e2t);
+ktheta = 1.75;
+e2t_close = ktheta*e2t/(1+ktheta*e2t);
+
+%% velocity command system
+t2v = minreal(thrust_2_outs(2));
+% rltool(t2v)
+kthrust = 2000;
+
+%%sim outputs
+
+output = sim('controller');
+x = output.simout.data(:,1);
+x = -x;
+init_x = x(1);
+y = output.simout.data(:,2);
+Gamma2 = output.simout.data(:,3);
+v = output.yout{2}.Values.data(:,1);
+vy = output.yout{8}.Values.data(:,1);
+t = output.tout;
+touch_down = -99;
+runwayx = 0:8000;
+runwayy = zeros(1, length(runwayx));
+glidex = 0:38162;
+glidey = tan(3*pi/180)*glidex;
+
+%% loop to calculate flight path angle for the flight
+Gamma = zeros(1, length(x));
+% vy = zeros(1, length(x));
+acc = zeros(1,length(x));
+for i = 1:(length(x)-1)
+    dx = x(i+1)-x(i);
+    dy = y(i+1)-y(i);
+    dt = t(i+1)-t(i);
+    ratio = dy/dx;
+
+    if y(i) < 0 && touch_down == -99
+        touch_down = x(i);
+    end
+%     Gamma(i) = -180*atan(ratio)/3.1415926535897423248;
+    Gamma(i) = 180*atan2(dy,-dx)/3.1415926535897423248;
+%     vy(i) = dy/dt;
+    if i ~= length(x)-1
+        acc(i) = (v(i+1)-v(i))/dt;
+        if dt < 0.00000001
+            acc(i) = acc(i-1);
+        end
+    end
+end
+Gamma(end) = Gamma(end-1);
+acc(end-1) = acc(end-2);
+acc(end) = acc(end-1);
+vy(end) = vy(end-1);
+disp([newline 'Touch down distance: ' num2str(touch_down) ' ft past runway start. Landing speed = ' num2str(vy(end)) ' ft/s'])
+
+
+h = figure();
+yyaxis left
+plot(x,y, 'DisplayName', 'Flight Path', 'LineWidth', 2);hold on;
+plot(runwayx, runwayy, 'DisplayName', 'Runway', 'LineWidth', 1, 'Color', [0 0 0])
+plot(-glidex, glidey, 'DisplayName', 'Glide Slope', 'LineWidth', 1)
+legend
+
+xlabel('Horizontal Location [ft]')
+ylabel('Height [ft]')
+% ylim([-500 2500])
+% xlim([-42000 10000])
+% xlim([-2000 2000])
+
+yyaxis right
+
+% plot(x, acc_y, 'DisplayName', 'acc y', 'LineWidth', 2)
+% ylabel('Vertical accel [ft/s2]')
+
+% yyaxis left
+plot(x, vy, 'DisplayName', 'Vy', 'LineWidth', 2)
+ylabel('Vertical velocity [ft/s]')
+% ylim([-18 5])
+legend
+grid
+
+
+set(h,'Units','Inches'); pos = get(h,'Position'); set(h,'PaperPositionMode','Auto','PaperUnits','Inches','PaperSize',[pos(3), pos(4)])
+print(h,'figs/flare_only','-dpdf','-r0')
+
+h = figure();
+plot(x, v, 'DisplayName', 'V', 'LineWidth', 2)
+ylabel('Airspeed [ft/s]')
+legend
+grid
+% 
+% 
+% set(h,'Units','Inches'); pos = get(h,'Position'); set(h,'PaperPositionMode','Auto','PaperUnits','Inches','PaperSize',[pos(3), pos(4)])
+% print(h,'figs/velocity_landing','-dpdf','-r0')
+% 
+% h = figure();
+% plot(x, acc, 'DisplayName', 'Acc', 'LineWidth', 2)
+% ylabel('acc [ft/s2]')
+% legend
+% grid
